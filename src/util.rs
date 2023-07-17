@@ -738,3 +738,194 @@ pub fn convert_json_key_lcase_first(src_json: Value) -> Value {
         value => value,
     }
 }
+
+mod dns_resolver {
+    use hyper::client::connect::dns::Name;
+    use once_cell::sync::Lazy;
+    use reqwest::dns::{Resolve, Resolving};
+    use std::{io, net::SocketAddr, sync::Arc};
+    use trust_dns_resolver::{
+        config::{ResolverConfig, ResolverOpts},
+        name_server::{GenericConnection, GenericConnectionProvider, TokioRuntime},
+        system_conf::read_system_conf,
+        AsyncResolver, TokioAsyncResolver, TokioHandle,
+    };
+
+    use crate::{util::is_global, Error, CONFIG};
+
+    #[derive(Debug, Clone)]
+    pub enum GlobalOnlyDnsResolver {
+        Default(),
+        TrustDns(Arc<AsyncResolver<GenericConnection, GenericConnectionProvider<TokioRuntime>>>),
+    }
+
+    impl GlobalOnlyDnsResolver {
+        pub fn new() -> Arc<Self> {
+            static SYSTEM_CONF: Lazy<io::Result<(ResolverConfig, ResolverOpts)>> = Lazy::new(read_system_conf);
+
+            if let Ok((config, opts)) = &*SYSTEM_CONF {
+                if let Ok(resolver) = TokioAsyncResolver::new(config.clone(), *opts, TokioHandle) {
+                    warn!("------- Creating TrustDNS resolver");
+                    return Arc::new(Self::TrustDns(Arc::new(resolver)));
+                };
+            }
+
+            warn!("------- Creating Tokio resolver");
+            Arc::new(Self::Default())
+        }
+    }
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+    impl Resolve for GlobalOnlyDnsResolver {
+        fn resolve(&self, name: Name) -> Resolving {
+            let this = self.clone();
+            Box::pin(async move {
+                warn!("-------- Resolving {name}");
+                let result = match this {
+                    Self::Default() => {
+                        let mut lookup = tokio::net::lookup_host(name.as_str())
+                            .await
+                            .map_err(|err| -> BoxError { Box::new(err) })?;
+
+                        lookup.next()
+                    }
+                    Self::TrustDns(resolver) => {
+                        let lookup = resolver.lookup_ip(name.as_str()).await?;
+                        lookup.into_iter().next().map(|a| SocketAddr::new(a, 0))
+                    }
+                };
+                warn!("-------- Resolved  {name} to {result:?}");
+
+                if let Some(addr) = &result {
+                    if CONFIG.icon_blacklist_non_global_ips() && !is_global(addr.ip()) {
+                        debug!("IP {} for domain '{name}' is not a global IP!", addr.ip());
+
+                        let msg = format!("Favicon '{name}' is hosted on a non-global IP!");
+                        let e: BoxError = Box::new(Error::new(&msg, &msg));
+                        return Err(e);
+                    }
+                }
+
+                let vec: reqwest::dns::Addrs = Box::new(result.into_iter());
+                Ok(vec)
+            })
+        }
+    }
+}
+
+pub use dns_resolver::GlobalOnlyDnsResolver;
+
+/// TODO: This is extracted from IpAddr::is_global, which is unstable:
+/// https://doc.rust-lang.org/nightly/std/net/enum.IpAddr.html#method.is_global
+/// Remove once https://github.com/rust-lang/rust/issues/27709 is merged
+#[allow(clippy::nonminimal_bool)]
+#[cfg(any(not(feature = "unstable"), test))]
+pub fn is_global_hardcoded(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            !(ip.octets()[0] == 0 // "This network"
+            || ip.is_private()
+            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0b1100_0000 == 0b0100_0000)) //ip.is_shared()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            // addresses reserved for future protocols (`192.0.0.0/24`)
+            ||(ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0)
+            || ip.is_documentation()
+            || (ip.octets()[0] == 198 && (ip.octets()[1] & 0xfe) == 18) // ip.is_benchmarking()
+            || (ip.octets()[0] & 240 == 240 && !ip.is_broadcast()) //ip.is_reserved()
+            || ip.is_broadcast())
+        }
+        std::net::IpAddr::V6(ip) => {
+            !(ip.is_unspecified()
+            || ip.is_loopback()
+            // IPv4-mapped Address (`::ffff:0:0/96`)
+            || matches!(ip.segments(), [0, 0, 0, 0, 0, 0xffff, _, _])
+            // IPv4-IPv6 Translat. (`64:ff9b:1::/48`)
+            || matches!(ip.segments(), [0x64, 0xff9b, 1, _, _, _, _, _])
+            // Discard-Only Address Block (`100::/64`)
+            || matches!(ip.segments(), [0x100, 0, 0, 0, _, _, _, _])
+            // IETF Protocol Assignments (`2001::/23`)
+            || (matches!(ip.segments(), [0x2001, b, _, _, _, _, _, _] if b < 0x200)
+                && !(
+                    // Port Control Protocol Anycast (`2001:1::1`)
+                    u128::from_be_bytes(ip.octets()) == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                    // Traversal Using Relays around NAT Anycast (`2001:1::2`)
+                    || u128::from_be_bytes(ip.octets()) == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                    // AMT (`2001:3::/32`)
+                    || matches!(ip.segments(), [0x2001, 3, _, _, _, _, _, _])
+                    // AS112-v6 (`2001:4:112::/48`)
+                    || matches!(ip.segments(), [0x2001, 4, 0x112, _, _, _, _, _])
+                    // ORCHIDv2 (`2001:20::/28`)
+                    || matches!(ip.segments(), [0x2001, b, _, _, _, _, _, _] if b >= 0x20 && b <= 0x2F)
+                ))
+            || ((ip.segments()[0] == 0x2001) && (ip.segments()[1] == 0xdb8)) // ip.is_documentation()
+            || ((ip.segments()[0] & 0xfe00) == 0xfc00) //ip.is_unique_local()
+            || ((ip.segments()[0] & 0xffc0) == 0xfe80)) //ip.is_unicast_link_local()
+        }
+    }
+}
+
+#[cfg(not(feature = "unstable"))]
+pub use is_global_hardcoded as is_global;
+
+#[cfg(feature = "unstable")]
+#[inline(always)]
+pub fn is_global(ip: std::net::IpAddr) -> bool {
+    ip.is_global()
+}
+
+/// These are some tests to check that the implementations match
+/// The IPv4 can be all checked in 30 seconds or so and they are correct as of nightly 2023-07-17
+/// The IPV6 can't be checked in a reasonable time, so we check about ten billion random ones, so far correct
+/// Note that the is_global implementation is subject to change as new IP RFCs are created
+///
+/// To run while showing progress output:
+/// cargo +nightly test --release --features sqlite,unstable -- --nocapture --ignored
+#[cfg(test)]
+#[cfg(feature = "unstable")]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[test]
+    #[ignore]
+    fn test_ipv4_global() {
+        for a in 0..u8::MAX {
+            println!("Iter: {}/255", a);
+            for b in 0..u8::MAX {
+                for c in 0..u8::MAX {
+                    for d in 0..u8::MAX {
+                        let ip = IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
+                        assert_eq!(ip.is_global(), is_global_hardcoded(ip), "IP mismatch: {}", ip)
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ipv6_global() {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut v = [0u8; 16];
+        let rand = SystemRandom::new();
+        for i in 0..1_000 {
+            println!("Iter: {}/1_000", i);
+            for _ in 0..10_000_000 {
+                rand.fill(&mut v).expect("Error generating random values");
+                let ip = IpAddr::V6(std::net::Ipv6Addr::new(
+                    (v[14] as u16) << 8 | v[15] as u16,
+                    (v[12] as u16) << 8 | v[13] as u16,
+                    (v[10] as u16) << 8 | v[11] as u16,
+                    (v[8] as u16) << 8 | v[9] as u16,
+                    (v[6] as u16) << 8 | v[7] as u16,
+                    (v[4] as u16) << 8 | v[5] as u16,
+                    (v[2] as u16) << 8 | v[3] as u16,
+                    (v[0] as u16) << 8 | v[1] as u16,
+                ));
+                assert_eq!(ip.is_global(), is_global_hardcoded(ip), "IP mismatch: {}", ip)
+            }
+        }
+    }
+}
